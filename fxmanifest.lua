@@ -6,17 +6,13 @@ game 'gta5'
 -- Resource Information
 name 'lc_cctv'
 author 'LC Development'
-version '1.0.0'
+version '2.0.0'
 repository 'https://github.com/LAURIDS0/lc_cctv'
-description 'Hack security rooms and turn the cameras off for a while, built on lc_hack'
+description 'Break into security rooms and watch the cameras live, built on lc_hack'
 
 -- Manifest
 shared_scripts {
     '@ox_lib/init.lua',
-}
-
-client_scripts {
-    'client/main.lua',
 }
 
 server_scripts {

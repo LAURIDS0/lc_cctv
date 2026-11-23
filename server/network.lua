@@ -1,9 +1,11 @@
 -- =====================================================================
 --  lc_cctv - network
---  Builds a new security network for every hack: the guard's
---  workstation and the NVR (the server that records the cameras).
---  The NVR's web panel gives away its login, and its root password is
---  hidden somewhere on it. New passwords in new places every time.
+--  Builds a new security network for every hack:
+--    the guard's workstation  ->  the NVR (records the cameras)  ->  the cameras
+--  The NVR's web panel gives its login away. Its camera list (with the
+--  cameras' IPs and passwords) is root only, and its root password is
+--  hidden on it. The cameras are on their own network, which only the
+--  NVR can reach, so the player views them from the NVR ("view <ip>").
 --  Plain Lua without FiveM natives, so it can be tested on its own.
 -- =====================================================================
 
@@ -50,37 +52,43 @@ local function pick(list)
     return list[math.random(#list)]
 end
 
+---A vector (vector3 or table) as a plain table, so it can be sent to the NUI
+local function vec(v, default)
+    v = v or default or {}
+    return { x = tonumber(v.x) or 0.0, y = tonumber(v.y) or 0.0, z = tonumber(v.z) or 0.0 }
+end
+
 local function page(title, body)
     return ('<!DOCTYPE html>\n<html>\n<head><title>%s</title></head>\n<body>\n<h1>%s</h1>\n%s\n</body>\n</html>'):format(title, title, body)
 end
 
 ---Builds the hack for one site.
----@param site { name: string, label: string }
----@param options { attempts: number, desktop?: string, subnet: number, cameras: number }
----@return table config A HackConfig for lc_hack (the target is the NVR)
+---@param site { name: string, label: string, cameras: table[] }
+---@param options { attempts: number, desktop?: string, subnet: number }
+---@return table config A HackConfig for lc_hack (no target: the player views cameras until they close it)
 function network.build(site, options)
-    local net = ('10.%d.1.'):format(options.subnet)
-    local guard = pick(GUARDS)
+    local office = ('10.%d.1.'):format(options.subnet)
+    local camNet = ('10.%d.2.'):format(options.subnet)
     local nvrHost = site.name .. '-nvr01'
     local login = network.password()
     local root = network.password()
-    local cameras = math.max(1, options.cameras or 6)
 
     local workstation = {
-        ip = net .. '20',
+        ip = office .. '20',
         host = site.name .. '-sec01',
-        user = guard,
+        user = pick(GUARDS),
         desktop = options.desktop,
         attempts = options.attempts,
-        target = net .. '40',
+        target = false,
         files = {
-            ['/etc/hosts'] = ('127.0.0.1\tlocalhost\n%s40\t%s'):format(net, nvrHost),
-            ['~/Desktop/shift_notes.txt'] = ('%s security - night shift\n- Camera feeds are recorded on %s\n- The web panel is at http://%s/\n- Report broken cameras to IT'):format(site.label, nvrHost, nvrHost),
+            ['/etc/hosts'] = ('127.0.0.1\tlocalhost\n%s40\t%s'):format(office, nvrHost),
+            ['~/Desktop/shift_notes.txt'] = ('%s security - night shift\n- The cameras are recorded on %s\n- The web panel is at http://%s/\n- Report broken cameras to IT'):format(site.label, nvrHost, nvrHost),
         },
     }
 
+    -- The NVR sits on the office network and on the camera network
     local nvr = {
-        ip = net .. '40',
+        ip = { office .. '40', camNet .. '1' },
         host = nvrHost,
         user = 'admin',
         password = login,
@@ -88,28 +96,42 @@ function network.build(site, options)
         ports = { 22, 80 },
         firewall = { allow = { workstation.ip }, open = { 80 } },
         processes = { '/opt/nvr/bin/nvrd --config /etc/nvr/nvr.conf', '/usr/sbin/nginx -g daemon on;' },
+        locked = { '/etc/nvr/cameras.conf' },
         files = {},
     }
 
-    -- The camera list and recordings, so it looks like the real thing
-    local cameraLines = {}
-    for i = 1, cameras do
+    -- The cameras: machines on the camera network, only the NVR may connect
+    local machines, lines = { nvr }, {}
+    for i, cam in ipairs(site.cameras or {}) do
+        local ip = camNet .. (100 + i)
+        local password = network.password()
         local id = ('cam%02d'):format(i)
-        cameraLines[#cameraLines + 1] = ('%s\trtsp://10.%d.2.%d/stream1\trecording'):format(id, options.subnet, 100 + i)
+        machines[#machines + 1] = {
+            ip = ip,
+            host = ('%s-%s'):format(site.name, id),
+            user = 'admin',
+            password = password,
+            ports = { 80, 554 },
+            firewall = { allow = { camNet .. '1' } },
+            camera = { coords = vec(cam.coords), rotation = vec(cam.rotation, { x = -15.0 }), fov = tonumber(cam.fov) or 60.0 },
+            files = { ['/etc/camera.conf'] = ('[camera]\nname=%s\nstream=rtsp://0.0.0.0:554/stream1'):format(cam.label or id) },
+        }
+        lines[#lines + 1] = ('%s\t%-16s rtsp://admin:%s@%s:554/stream1'):format(id, cam.label or id, password, ip)
         nvr.files[('/srv/recordings/%s/2026-11-22.mp4'):format(id)] = '\0\0\0\24ftypisom\0\0(video)'
     end
-    nvr.files['/etc/nvr/cameras.conf'] = '# id\tstream\tstate\n' .. table.concat(cameraLines, '\n')
+    nvr.files['/etc/nvr/cameras.conf'] = '# id\tname\t\t stream\n' .. table.concat(lines, '\n')
+    nvr.files['/opt/nvr/README'] = 'The camera list is in /etc/nvr/cameras.conf (root only). View a camera with: view <ip>'
 
-    -- Where the NVR's web login is given away: an HTML comment, an install
-    -- note the panel links to, or a note on the guard's desktop (base64)
+    -- Where the NVR's web login is given away
     local loginClue = math.random(3)
+    local form = '<form><input name="user"> <input name="pass" type="password"> <button>Log in</button></form>'
     if loginClue == 1 then
-        nvr.files['/var/www/html/index.html'] = page(site.label .. ' NVR', ('<form><input name="user"> <input name="pass" type="password"> <button>Log in</button></form>\n<!-- TODO remove before go-live: admin / %s -->'):format(login))
+        nvr.files['/var/www/html/index.html'] = page(site.label .. ' NVR', ('%s\n<!-- TODO remove before go-live: admin / %s -->'):format(form, login))
     elseif loginClue == 2 then
-        nvr.files['/var/www/html/index.html'] = page(site.label .. ' NVR', '<form><input name="user"> <input name="pass" type="password"> <button>Log in</button></form>\n<p>First time here? Read the <a href="install/README.txt">install notes</a>.</p>')
+        nvr.files['/var/www/html/index.html'] = page(site.label .. ' NVR', form .. '\n<p>First time here? Read the <a href="install/README.txt">install notes</a>.</p>')
         nvr.files['/var/www/html/install/README.txt'] = ('NVR install notes\n\n1. Mount the cameras\n2. Log in with the default account: admin / %s\n3. Change the password (!)'):format(login)
     else
-        nvr.files['/var/www/html/index.html'] = page(site.label .. ' NVR', '<form><input name="user"> <input name="pass" type="password"> <button>Log in</button></form>\n<p>Forgot your password? Ask the security office.</p>')
+        nvr.files['/var/www/html/index.html'] = page(site.label .. ' NVR', form .. '\n<p>Forgot your password? Ask the security office.</p>')
         workstation.files['~/Desktop/nvr_login.txt'] = ('NVR web + ssh\nuser: admin\npass (base64): %s'):format(network.base64(login))
     end
 
@@ -117,14 +139,13 @@ function network.build(site, options)
     local rootClue = pick({
         { '/etc/nvr/nvr.conf', ('[nvr]\nretention_days=30\nlisten=0.0.0.0:80\n\n[maintenance]\nroot_password=%s\n'):format(root) },
         { '/opt/nvr/bin/nvrd', ('\127ELF\2\1\1\0libnvr.so\0rtsp_open\0MAINT_ROOT=%s\0nvrd 3.2.1\0'):format(root) },
-        { '/home/admin/.bash_history', ('cat /etc/nvr/cameras.conf\nsudo -s\n%s\nsystemctl restart nvrd\nexit'):format(root) },
+        { '/home/admin/.bash_history', ('ls /srv/recordings\nsudo -s\n%s\ncat /etc/nvr/cameras.conf\nexit'):format(root) },
     })
     nvr.files[rootClue[1]] = rootClue[2]
-    -- A password that is no longer used, to cost careless players an attempt
     nvr.files['/etc/nvr/nvr.conf.bak'] = ('# old config\n[maintenance]\nroot_password=%s\n'):format(otherPassword(root))
     workstation.files['~/Documents/old_passwords.txt'] = ('NVR (before the update): admin / %s'):format(otherPassword(login))
 
-    workstation.network = { nvr }
+    workstation.network = machines
     return workstation
 end
 
